@@ -1,0 +1,12 @@
+services:
+  computer-use:
+    container_name: computer-use
+    build: .
+    ports:
+      - 8083:8083
+      - 5901:5901
+      - 6080:6080
+    env_file:
+      - .env.local
+    tty: true
+    stdin_open: true
