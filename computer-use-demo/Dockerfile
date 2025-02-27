@@ -101,4 +101,12 @@ ENV DISPLAY_NUM=$DISPLAY_NUM
 ENV HEIGHT=$HEIGHT
 ENV WIDTH=$WIDTH
 
+# Expose required ports
+EXPOSE 5901
+EXPOSE 6080
+EXPOSE 8083
+
+# Environment variable for Anthropic API key (to be provided at runtime)
+ENV ANTHROPIC_API_KEY=""
+
 ENTRYPOINT [ "./entrypoint.sh" ]
