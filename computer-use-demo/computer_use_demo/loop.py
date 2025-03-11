@@ -112,9 +112,8 @@ async def sampling_loop(
         if enable_prompt_caching:
             betas.append(PROMPT_CACHING_BETA_FLAG)
             _inject_prompt_caching(messages)
-            # Because cached reads are 10% of the price, we don't think it's
-            # ever sensible to break the cache by truncating images
-            only_n_most_recent_images = 0
+            # Don't disable image filtering even with prompt caching
+            # We need to keep the image count below API limits regardless
             # Use type ignore to bypass TypedDict check until SDK types are updated
             system["cache_control"] = {"type": "ephemeral"}  # type: ignore
 
@@ -193,10 +192,9 @@ def _maybe_filter_to_n_most_recent_images(
     """
     With the assumption that images are screenshots that are of diminishing value as
     the conversation progresses, remove all but the final `images_to_keep` tool_result
-    images in place, with a chunk of min_removal_threshold to reduce the amount we
-    break the implicit prompt cache.
+    images in place to ensure we stay under API limits.
     """
-    if images_to_keep is None:
+    if images_to_keep is None or images_to_keep <= 0:
         return messages
 
     tool_result_blocks = cast(
@@ -218,9 +216,9 @@ def _maybe_filter_to_n_most_recent_images(
         if isinstance(content, dict) and content.get("type") == "image"
     )
 
-    images_to_remove = total_images - images_to_keep
-    # for better cache behavior, we want to remove in chunks
-    images_to_remove -= images_to_remove % min_removal_threshold
+    images_to_remove = max(0, total_images - images_to_keep)
+    # Don't use modulo to keep chunks - we need to ensure we stay under limits
+    # images_to_remove -= images_to_remove % min_removal_threshold
 
     for tool_result in tool_result_blocks:
         if isinstance(tool_result.get("content"), list):

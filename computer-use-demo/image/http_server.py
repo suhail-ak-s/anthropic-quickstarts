@@ -109,7 +109,7 @@ class ServerConfig:
         self.model = os.getenv("MODEL", DEFAULT_MODEL)
         self.api_key = get_api_key()
         self.custom_system_prompt = load_from_storage("system_prompt") or ""
-        self.only_n_most_recent_images = int(os.getenv("ONLY_N_MOST_RECENT_IMAGES", "3"))
+        self.only_n_most_recent_images = int(os.getenv("ONLY_N_MOST_RECENT_IMAGES", "90"))
         self.hide_images = os.getenv("HIDE_IMAGES", "false").lower() == "true"
         self.token_efficient_tools_beta = os.getenv("TOKEN_EFFICIENT_TOOLS_BETA", "false").lower() == "true"
         
@@ -167,7 +167,8 @@ class ServerConfig:
             self.custom_system_prompt = config_data["custom_system_prompt"]
             save_to_storage("system_prompt", self.custom_system_prompt)
         if "only_n_most_recent_images" in config_data:
-            self.only_n_most_recent_images = int(config_data["only_n_most_recent_images"])
+            # Cap at 90 images to stay well below the API limit of 100
+            self.only_n_most_recent_images = min(int(config_data["only_n_most_recent_images"]), 90)
         if "hide_images" in config_data:
             self.hide_images = config_data["hide_images"]
         if "token_efficient_tools_beta" in config_data:
@@ -220,6 +221,60 @@ class ChatState:
         self.config = ServerConfig()
         self.in_sampling_loop = False
         logger.info(f"Created new ChatState with request_id: {self.request_id}")
+
+    def cleanup_history(self, max_images=90):
+        """
+        Ensure that the total number of images in the message history doesn't exceed max_images.
+        This helps prevent "Too much media" errors from the Anthropic API.
+        """
+        if not self.messages:
+            return
+            
+        # Count total images in the conversation history
+        total_images = 0
+        image_blocks = []
+        
+        for message in self.messages:
+            if not isinstance(message.get("content"), list):
+                continue
+                
+            for block in message["content"]:
+                if isinstance(block, dict):
+                    # Count images in tool results
+                    if block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                        for content in block["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image":
+                                total_images += 1
+                                image_blocks.append((message, block, content))
+                    # Count direct images
+                    elif block.get("type") == "image":
+                        total_images += 1
+                        image_blocks.append((message, None, block))
+        
+        # If we're over the limit, remove oldest images first
+        images_to_remove = max(0, total_images - max_images)
+        logger.info(f"Chat history has {total_images} images, removing {images_to_remove}")
+        
+        for i in range(images_to_remove):
+            if i >= len(image_blocks):
+                break
+                
+            message, tool_result, image = image_blocks[i]
+            
+            if tool_result:
+                # Image is inside a tool result
+                tool_result["content"].remove(image)
+                # If tool result is now empty, remove it
+                if not tool_result["content"]:
+                    message["content"].remove(tool_result)
+            else:
+                # Image is directly in message content
+                message["content"].remove(image)
+            
+        # Clean up empty messages
+        self.messages = [msg for msg in self.messages if msg.get("content")]
+        
+        logger.info(f"Cleaned up history, now has {total_images - images_to_remove} images")
 
     def maybe_add_interruption_blocks(self):
         """Add interruption blocks to the conversation if needed."""
@@ -489,6 +544,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             
             config = self._chat_state.config
+            
+            # Clean up history to ensure we don't exceed image limits
+            max_images = min(90, config.only_n_most_recent_images or 90)
+            self._chat_state.cleanup_history(max_images=max_images)
             
             # Run the agent sampling loop with tracking
             with self._chat_state.track_sampling_loop():
