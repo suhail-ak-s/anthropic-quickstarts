@@ -89,6 +89,9 @@ RUN python -m pip install --upgrade pip==23.1.2 setuptools==58.0.4 wheel==0.40.0
 # only reinstall if requirements.txt changes
 COPY --chown=$USERNAME:$USERNAME computer_use_demo/requirements.txt $HOME/computer_use_demo/requirements.txt
 RUN python -m pip install -r $HOME/computer_use_demo/requirements.txt
+# Run the following command to install all necessary dependencies
+RUN python -m playwright install-deps
+RUN python -m playwright install
 
 # setup desktop env & app
 COPY --chown=$USERNAME:$USERNAME image/ $HOME
