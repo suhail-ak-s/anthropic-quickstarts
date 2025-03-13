@@ -8,7 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from functools import partial
 import anthropic
 from anthropic import RateLimitError
-from computer_use_demo.loop import sampling_loop
+from computer_use_demo.loop import sampling_loop, APIProvider
 from computer_use_demo.tools import ToolResult, ToolVersion
 from typing import Any, Dict, Optional, cast, get_args
 import httpx
@@ -29,11 +29,70 @@ HTTP Server for Claude Computer Use Demo
 
 Features:
 - Supports Claude 3.5 and 3.7 models
+- Supports both Anthropic API and AWS Bedrock (Bedrock is default)
 - Thinking capability is enabled by default for Claude 3.7 models
 - Configurable via environment variables or API
 - Streaming responses with Server-Sent Events
 - Persistent chat state across requests
 """
+
+# Define validate_aws_credentials function before it's used
+def validate_aws_credentials():
+    """Validate AWS credentials for Bedrock access."""
+    try:
+        import boto3
+        session = boto3.Session()
+        credentials = session.get_credentials()
+        
+        # Check for credentials
+        if not credentials:
+            logger.warning("No AWS credentials found - please configure AWS credentials")
+            logger.info("You can set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables")
+            logger.info("Or configure ~/.aws/credentials file")
+            return False
+        
+        # Check credential expiration if temporary
+        if hasattr(credentials, 'expiry_time') and credentials.expiry_time:
+            expiry = credentials.expiry_time
+            now = datetime.now()
+            if expiry < now:
+                logger.warning(f"AWS credentials have expired on {expiry}")
+                return False
+            elif expiry < now + timedelta(hours=1):
+                logger.warning(f"AWS credentials will expire soon: {expiry}")
+        
+        # Check for region
+        region = os.environ.get("AWS_REGION")
+        if not region:
+            region = session.region_name
+            
+        if not region:
+            logger.warning("AWS_REGION environment variable not set and no default region found")
+            logger.info("Please set AWS_REGION environment variable or configure region in AWS config")
+            return False
+            
+        # Check if we can access Bedrock service
+        try:
+            # Just initialize a client to check if we can connect to Bedrock
+            # We don't actually call any methods
+            bedrock_client = session.client('bedrock-runtime', region_name=region)
+            logger.info(f"Successfully configured AWS Bedrock with region: {region}")
+            return True
+        except Exception as e:
+            if "could not be found" in str(e):
+                logger.error(f"Bedrock service not available in region {region}")
+                logger.info("Make sure to use a region where Bedrock is available, like us-east-1 or us-west-2")
+            else:
+                logger.error(f"Error connecting to Bedrock service: {str(e)}")
+            return False
+            
+    except ImportError:
+        logger.error("boto3 package not installed - required for Bedrock access")
+        logger.info("Install boto3 with: pip install boto3")
+        return False
+    except Exception as e:
+        logger.error(f"Error validating AWS credentials: {str(e)}")
+        return False
 
 # Default configuration
 CONFIG_DIR = Path("~/.anthropic").expanduser()
@@ -41,6 +100,7 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Constants
 DEFAULT_MODEL = "claude-3-7-sonnet-20250219"
+DEFAULT_BEDROCK_MODEL = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
 INTERRUPT_TEXT = "(user stopped or interrupted and wrote the following)"
 INTERRUPT_TOOL_ERROR = "human stopped or interrupted tool execution"
 
@@ -103,11 +163,49 @@ def save_to_storage(filename: str, data: str) -> None:
     except Exception as e:
         logger.error(f"Error saving {filename}: {e}")
 
+def format_model_name_for_provider(model: str, provider: str) -> str:
+    """Format the model name appropriately for the given provider."""
+    if provider == "bedrock":
+        # Handle the us.anthropic prefix format
+        if model.startswith("us.anthropic."):
+            return model
+            
+        # Ensure Bedrock model names have the 'anthropic.' prefix if not already present
+        if not model.startswith("anthropic."):
+            # Map Anthropic model names to Bedrock model names
+            model_mapping = {
+                "claude-3-5-sonnet-20240620": "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+                "claude-3-7-sonnet-20250219": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            }
+            return model_mapping.get(model, DEFAULT_BEDROCK_MODEL)
+        return model
+    else:
+        # For Anthropic API, remove the prefixes if present
+        if model.startswith("us.anthropic."):
+            parts = model.split(":")
+            model_name = parts[0].replace("us.anthropic.", "")
+            return model_name
+        elif model.startswith("anthropic."):
+            parts = model.split(":")
+            model_name = parts[0].replace("anthropic.", "")
+            return model_name
+        return model
+
 class ServerConfig:
     def __init__(self):
         # Load configuration from environment or config files
-        self.model = os.getenv("MODEL", DEFAULT_MODEL)
-        self.api_key = get_api_key()
+        self.api_provider = os.getenv("API_PROVIDER", "bedrock")
+        model_env = os.getenv("MODEL")
+        if model_env:
+            self.model = model_env
+        else:
+            self.model = DEFAULT_BEDROCK_MODEL if self.api_provider == "bedrock" else DEFAULT_MODEL
+        
+        # Format model name appropriately for the provider
+        self.model = format_model_name_for_provider(self.model, self.api_provider)
+        
+        # Only get API key for Anthropic provider
+        self.api_key = get_api_key() if self.api_provider == "anthropic" else None
         self.custom_system_prompt = load_from_storage("system_prompt") or ""
         self.only_n_most_recent_images = int(os.getenv("ONLY_N_MOST_RECENT_IMAGES", "90"))
         self.hide_images = os.getenv("HIDE_IMAGES", "false").lower() == "true"
@@ -115,8 +213,13 @@ class ServerConfig:
         
         # Set model configuration
         self._set_model_config()
-            
-        logger.info(f"Server configured with model: {self.model}")
+
+        # For Bedrock provider, validate AWS credentials on startup
+        if self.api_provider == "bedrock":
+            if not validate_aws_credentials():
+                logger.warning("AWS credentials not properly configured for Bedrock. Some features may not work.")
+        
+        logger.info(f"Server configured with provider: {self.api_provider}, model: {self.model}")
     
     def _set_model_config(self):
         """Set model configuration based on the selected model."""
@@ -153,14 +256,29 @@ class ServerConfig:
                 # Use custom budget if specified
                 self.thinking_budget = int(os.getenv("THINKING_BUDGET"))
         
-        logger.info(f"Model configuration: model={self.model}, thinking_enabled={self.thinking_budget is not None}")
+        logger.info(f"Model configuration: provider={self.api_provider}, model={self.model}, thinking_enabled={self.thinking_budget is not None}")
         
     def update_from_request(self, config_data: Dict[str, Any]) -> None:
         """Update configuration from a request."""
+        provider_changed = False
+        if "api_provider" in config_data:
+            if self.api_provider != config_data["api_provider"]:
+                provider_changed = True
+            self.api_provider = config_data["api_provider"]
+            # If switching providers, update model to default for that provider
+            if provider_changed and "model" not in config_data:
+                self.model = DEFAULT_MODEL if self.api_provider == "anthropic" else DEFAULT_BEDROCK_MODEL
+                
         if "model" in config_data:
             self.model = config_data["model"]
+            
+        # Format model name appropriately for the provider
+        self.model = format_model_name_for_provider(self.model, self.api_provider)
+        
+        if provider_changed or "model" in config_data:
             self._set_model_config()
-        if "api_key" in config_data and config_data["api_key"]:
+            
+        if "api_key" in config_data and config_data["api_key"] and self.api_provider == "anthropic":
             self.api_key = config_data["api_key"]
             save_to_storage("api_key", self.api_key)
         if "custom_system_prompt" in config_data:
@@ -193,11 +311,12 @@ class ServerConfig:
             # assume thinking is enabled
             self.thinking_budget = int(config_data["thinking_budget"])
             
-        logger.info(f"Configuration updated: model={self.model}, thinking_enabled={self.thinking_budget is not None}")
+        logger.info(f"Configuration updated: provider={self.api_provider}, model={self.model}, thinking_enabled={self.thinking_budget is not None}")
         
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
-        return {
+        config_dict = {
+            "api_provider": self.api_provider,
             "model": self.model,
             "custom_system_prompt": self.custom_system_prompt,
             "only_n_most_recent_images": self.only_n_most_recent_images,
@@ -209,8 +328,28 @@ class ServerConfig:
             "thinking_enabled": self.thinking_budget is not None,
             "thinking_budget": self.thinking_budget,
             "available_tool_versions": list(get_args(ToolVersion)),
-            "available_models": list(MODEL_TO_MODEL_CONF.keys()) + ["claude-3-5-sonnet-20240620"]
+            "available_models": list(MODEL_TO_MODEL_CONF.keys()) + ["claude-3-5-sonnet-20240620"],
+            "available_providers": ["anthropic", "bedrock"]
         }
+        
+        # Add provider-specific information
+        if self.api_provider == "bedrock":
+            # Add Bedrock-specific information
+            config_dict["bedrock_models"] = [
+                "us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+                "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+            ]
+            config_dict["aws_region"] = os.environ.get("AWS_REGION", "Not set")
+            
+            # Check AWS credentials status
+            has_credentials = validate_aws_credentials()
+            config_dict["aws_credentials_valid"] = has_credentials
+        elif self.api_provider == "anthropic":
+            # Add Anthropic-specific information
+            config_dict["has_api_key"] = self.api_key is not None
+        
+        return config_dict
 
 class ChatState:
     def __init__(self):
@@ -220,7 +359,16 @@ class ChatState:
         self.request_id = datetime.now().isoformat()
         self.config = ServerConfig()
         self.in_sampling_loop = False
-        logger.info(f"Created new ChatState with request_id: {self.request_id}")
+        
+        # Validate credentials based on provider
+        if self.config.api_provider == "bedrock":
+            if not validate_aws_credentials():
+                logger.warning("AWS credentials not properly configured")
+                # Don't raise an exception here, just log a warning
+        elif self.config.api_provider == "anthropic" and not self.config.api_key:
+            logger.warning("Anthropic API key not set")
+        
+        logger.info(f"Created new ChatState with request_id: {self.request_id}, provider: {self.config.api_provider}")
 
     def cleanup_history(self, max_images=90):
         """
@@ -549,11 +697,18 @@ class APIHandler(BaseHTTPRequestHandler):
             max_images = min(90, config.only_n_most_recent_images or 90)
             self._chat_state.cleanup_history(max_images=max_images)
             
+            # Check credentials based on provider
+            if config.api_provider == "bedrock":
+                if not validate_aws_credentials():
+                    raise Exception("AWS credentials not properly configured for Bedrock access")
+            elif config.api_provider == "anthropic" and not config.api_key:
+                raise Exception("Anthropic API key not provided")
+            
             # Run the agent sampling loop with tracking
             with self._chat_state.track_sampling_loop():
                 self._chat_state.messages = await sampling_loop(
                     model=config.model,
-                    provider="anthropic",
+                    provider=APIProvider(config.api_provider),
                     messages=self._chat_state.messages,
                     api_key=config.api_key,
                     system_prompt_suffix=config.custom_system_prompt,
@@ -744,9 +899,25 @@ class ThreadedHTTPServer(HTTPServer):
 def run_server(port=8083):
     try:
         print(f"Starting API server initialization on port {port}...")
+        
+        # Check credentials based on default provider
+        default_provider = os.getenv("API_PROVIDER", "bedrock")
+        if default_provider == "bedrock":
+            if not validate_aws_credentials():
+                print("WARNING: AWS credentials not properly configured for Bedrock")
+                print("Make sure AWS_REGION, AWS_ACCESS_KEY_ID, and AWS_SECRET_ACCESS_KEY are set")
+                print("Or ensure AWS credentials file is properly configured")
+        elif default_provider == "anthropic":
+            try:
+                get_api_key()
+            except ValueError:
+                print("WARNING: Anthropic API key not set")
+                print("Set ANTHROPIC_API_KEY environment variable or create ~/.anthropic/api_key file")
+        
         server_address = ("0.0.0.0", port)  # Explicitly bind to all interfaces
         httpd = ThreadedHTTPServer(server_address, APIHandler)
         print(f"API Server is running at http://0.0.0.0:{port}")
+        print(f"Using {default_provider.upper()} as the default provider")
         print("Server is ready to handle requests")
         httpd.serve_forever()
     except Exception as e:
